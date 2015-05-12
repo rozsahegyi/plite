@@ -1,215 +1,230 @@
-# coding=utf-8
+import os, threading, socket, time, itertools
+from collections import deque
+import ping, config, wxtray
 
-import sys, os, re, json, time, socket
-import threading, collections, itertools
-from functools import partial
-from ping import Ping
-sys.path.append(os.path.realpath(os.path.curdir + '\\Lib\\site-packages'))
+def message(msg, *args):
+	print '%s.%03d  %s' % (time.strftime('%H:%M:%S'), time.time() % 1 * 1000, msg), args or ''
+	pass
 
-import wx
-from flask import Flask, render_template, make_response
-# from PIL import Image
-# from StringIO import StringIO
-
-
-class mapping(dict):
-	"""Dict with attribute access, credits to: http://stackoverflow.com/a/14620633/1393194"""
-	def __init__(self, content, *args, **kw):
-		if isinstance(content, (str, unicode)):
-			content = self.unpack(content)
-		elif not hasattr(content, 'iteritems'):
-			raise Exception('mapping with %s argument' % type(content))
-		super(mapping, self).__init__(content, *args, **kw)
-		self.__dict__ = self
-		[self.__setitem__(k, mapping(v)) for k, v in self.iteritems() if isinstance(v, dict)]
-
-	def pack(self): return json.dumps(self, ensure_ascii=False)
-	def unpack(self, content): return json.loads(content)
-
-def index():
-	content = "running pings..."
-	return render_template('netwatch.html', content=content)
-
-class App(wx.App):
+class Plite(object):
 	def __init__(self, config):
-		[setattr(self, k, v) for k, v in config.iteritems()]
 		self.running = False
-		self.pings = collections.deque(((0, 1),) * self.store_pings)
-		super(App, self).__init__(False)
+		self.config = config
+		self.wxapp = wxtray.App(self, hosts=config.hosts, icon_size=config.icon_size, **config.wxapp)
+		self.charts = Charts(self, icon_size=config.icon_size)
+		message('Setting up hosts...')
+		self.hosts = [Pinger(url, **config.pinger) for url in config.hosts]
+		self.saved = 0
 
-	def OnInit(self):
-		self.frame = wx.Frame(None, wx.ID_ANY, 'Plite 1.0')#, style=wx.FRAME_NO_TASKBAR)
-		self.tb = wx.TaskBarIcon()
-		self.tb.frame = self.frame
+	@property
+	def results(self):
+		# only used every x seconds once, no need to cache
+		return [(pinger.destination, pinger.results) for pinger in self.hosts]
 
-		self.Bind(wx.EVT_SET_FOCUS, self.FrameFocus)
-		self.frame.Bind(wx.EVT_SET_FOCUS, self.FrameFocus)
-		self.frame.Bind(wx.EVT_CLOSE, self.OnClose)
-		self.tb.Bind(wx.EVT_SET_FOCUS, self.TaskBarFocus)
-		self.tb.Bind(wx.EVT_TASKBAR_LEFT_DCLICK, self.OnClose)
-		self.tb.Bind(wx.EVT_TASKBAR_RIGHT_UP, self.TaskBarMenu)
+	def ping_hosts(self):
+		"""Runs threads for pinging each host, blocks for timeout seconds."""
+		for x in self.hosts: threading.Thread(target=x.ping).start()
+		time.sleep(self.config.pinger.timeout + 0.3)
+		for x in self.hosts:
+			if len(x.results[-1]) > 2: msg = ', '.join(map(str, x.results[-1][2:]))
+			elif not x.results[-1][1]: msg = 'response timed out'
+			elif x.results[-1][1] < 0: msg = 'sending timed out'
+			else: continue
+			message('%-20s  %s' % (x.destination, msg), x.results[-1])
 
-		self.setup_menu()
-		# self.tb.SetIcon(wx.Icon('icons/favicon.ico', wx.BITMAP_TYPE_ICO))
-		self.update_icon()
-		self.set_interval(self.interval)
-		self.start_updates()
-		return True
+	def update_wxapp(self):
+		self.wxapp.update_event(self.charts.compose_icon(self.results))
 
-	def setup_menu(self):
-		menu = wx.Menu()
-		menu_item = lambda item: (wx.NewId(), item[0]) if item[0] else (wx.ID_SEPARATOR, '')
-		[item.__setitem__(0, menu.Append(*menu_item(item))) for item in self.menu]
+	def start(self):
+		threading.Thread(target=self.run).start()
+		self.update_wxapp()
+		self.wxapp.MainLoop()
 
-		# seems the callback function has to be bound (there has to be a simpler way though)
-		# create a lambda (calling the intended callback with passed arguments), and bind it to self
-		bound_func = lambda s1, f: partial(lambda s2, e: getattr(s1, f[1])(e, *f[2:]), s1)
-		events = [(wx.EVT_MENU, bound_func(self, item), item[0]) for item in self.menu if item[1:]]
-		list(itertools.starmap(self.tb.Bind, events))
-
-		self.menu = menu
-
-	def OnClose(self, event):
-		print 'program closed', event
-		self.running = False
-		self.tb.RemoveIcon()
-		self.tb.Destroy()
-		self.frame.Destroy()
-		self.Exit()
-
-	def FrameFocus(self, event):
-		# print 'FrameFocus:', event, event.EventObject, event.Id
-		pass
-
-	def TaskBarFocus(self, event):
-		# print 'TaskBarFocus:', event, event.EventObject, event.Id
-		pass
-
-	def TaskBarMenu(self, event):
-		# print 'TaskBarMenu:', event, event.EventObject, event.Id
-		# print self.menu.MenuItems[0].Text
-		self.tb.PopupMenu(self.menu)
-
-	def MenuClick(self, event, *args):
-		# print 'OnKeyPress:', event, event.EventObject, event.Id
-		pass
-
-	def set_interval(self, event, interval=1):
-		self.interval = interval
-		self.menu.MenuItems[0].Text = '%s: %g sec' % (self.menu.MenuItems[0].Text.split(':')[0], interval)
-		print 'set_interval:', interval
-
-	def start_updates(self):
-		thread = threading.Thread(target=self.run_updates)
-		thread.start()
-
-	def run_updates(self):
-		self.running = True
+	def run(self):
 		last = int(time.time())
-		while self.running:
+		time_to_ping = lambda now: now >= last
+		time_to_save = lambda now: now >= self.saved
+		self.running = True
+		message('Plite running...')
+
+		while self.running and self.wxapp.running:
 			now = time.time()
-			if now >= last:
-				last += self.interval
-				self.ping_result(now, self.pinger.ping())
-				self.update_icon()
-			else:
-				time.sleep(0.05)
+			if time_to_ping(now):
+				last += self.wxapp.rate
+				# message('Pinging...')
+				self.ping_hosts()
+				# message('Updating...')
+				self.update_wxapp()
+			if time_to_save(now):
+				self.saved = now + self.config.save_interval
+				threading.Thread(target=self.save).start()
+			time.sleep(0.05)
+		message('Plite stopped.')
 
-	def ping_result(self, timestamp, res):
-		last = self.pings[-1] if self.pings else (0, 0)
-		if last[0] > timestamp: return
-		self.pings.append((timestamp, res))
-		if len(self.pings) > self.store_pings: self.pings.popleft()
+	def save(self):
+		for x in self.hosts: self.save_results(x)
 
-	def update_icon(self, data=None):
-		if not data: data = self.icon_map()
-		icon = wx.EmptyIcon()
-		icon.CopyFromBitmap(wx.BitmapFromBuffer(self.icon_size, self.icon_size, data))
-		if self.tb: self.tb.SetIcon(icon) # make sure the taskbar still exists # RemoveIcon
+	def save_results(self, pinger):
+		data = pinger.unsaved_results()
+		if not data: return
+		print 'saving:', pinger.destination, data
+		data = '\n'.join(':'.join(map(str, x)) for x in data) + '\n'
+		stamp = time.strftime('%Y%m%d', time.localtime(pinger.today))
+		save_dir = self.config.save_dir
+		if not os.path.exists(save_dir): os.makedirs(save_dir)
+		filename = '%s_%s.txt' % (pinger.destination, stamp)
+		filename = os.path.join(save_dir, filename)
+		# with open(filename, 'a') as f: f.write(data)
 
-	def icon_map(self):
-		# helpers:
-		# normalize ping time in the 0..1 range (ratio to self.slowest_ping)
-		# colors for a 0..1 range
-		# pixel columns: self.icon_size * (1-x) * black_pixels + self.icon_size * x * color_pixels
-		normalize = lambda x: (min((x[1] or 1000) / float(self.slowest_ping), 1))
-		colorize = lambda x: (int(255 * min(1, 2 * x)), int(255 * min(1, 2 * (1 - x))), 0)
-		to_column = lambda x: ((0, 0, 0),) * int(round(self.icon_size * (1 - x))) + (colorize(x),) * int(round(self.icon_size * x))
 
-		data = map(normalize, list(self.pings)[-self.icon_size:])
-		data = map(to_column, data)
-		data = zip(*data) # flips the generated pixels (along the nw-se axis)
-		data = list(itertools.chain(*data)) # flattened list of pixel tuples
+# class Pinger(ping.Ping):
+class Pinger(object):
+	blank = (0, -1)
+	results = []
 
-		# set two blips alongside the top of the image
-		i = (self.icon_size - int(time.time() / self.interval % 16) - 1) % 8
-		blip = (255, 255, 255)
-		indexes = [0, self.icon_size, 0.5 * self.icon_size, 1.5 * self.icon_size]
-		[data.__setitem__(i + int(x), blip) for x in indexes]
+	def __init__(self, url='', timeout=0.8, stored=100, **kw):
+		if not url: raise Exception('Pinger instances always need an url.')
+		# super(Pinger, self).__init__(url, timeout * 1000)
+		self.destination = url
+		self.timeout = timeout * 1000
+		self.results = deque((self.blank,) * stored, maxlen=stored)
+		self.stored = stored
+		self.counter = 0
+		self.lock = threading.Semaphore()
+		self.update_times()
 
-		return bytearray(list(itertools.chain(*data)))
+	def update_times(self):
+		# smaller numbers take less on the disk, and easier to work with,
+		# so store timestamps relative to the start of the day
+		t = time.localtime()
+		today = list(t[0:3] + (0, 0, 0) + t[6:])
+		tomorrow = today[0:2] + [today[2] + 1] + today[3:]
+		self.today = int(time.mktime(today))
+		self.tomorrow = int(time.mktime(tomorrow))
+		self.saved_at = 0
 
-class Pinger(Ping):
-	def __init__(self, url, timeout=None):
-		Ping.__init__(self, url, timeout * 1000)
+	@property
+	def timestamp(self):
+		now = int(time.time())
+		if now >= self.tomorrow: self.update_times()
+		return now - self.today
 
-	def ping(self, url=None, timeout=None):
-		if url: self.destination, self.dest_ip = url, socket.gethostbyname(url)
-		if timeout: self.timeout = timeout
-		try: res = self.do()
-		except socket.error, e: res = e
-		return res
-		# result = make_response(str(res), 200)
-		# result.headers['Content-type'] = 'json'#text/json'
-		# return result
+	def ping(self):
+		pinger = ping.Ping(self.destination, self.timeout)
+		timestamp = self.timestamp
+		counter = self.add_result(timestamp)
+		res, error = 0, ()
+
+		# res becomes a positive number or None (failed ping, no exception),
+		# otherwise a socket exception is raised
+		try: res = pinger.do()
+		except socket.error as e: error = (e.__class__.__name__, e.message) + e.args
+		res = int(max(1, res)) if res else 0
+
+		# find the slot which this result should go into
+		index = self.counter - counter
+		if index > self.stored: return
+		self.results[-index] = (timestamp, res) + error
+
+	def add_result(self, timestamp):
+		# add a slot for this result, and store the counter to index it later
+		self.results.append((timestamp, -1))
+		self.counter = (self.counter + 1) % self.stored
+		return self.counter - 1
+
+	def result_slice(self, interval=None):
+		# no slicing for deque, have to take results one by one instead
+		# this means results can change during iteration, so do it backwards,
+		# this way the only problem are duplicated points, which are ignored
+		# this is O(n) because of the temporary deque, slightly better than
+		# appending to a list + reversing
+
+		now = self.timestamp
+		if not interval: interval = now - 60
+		if isinstance(interval, int): interval = [interval, 0]
+		if not interval[1]: interval[1] = now
+		prev = None
+		deck = deque()
+
+		for index in xrange(1, self.stored + 1):
+			point = self.results[-index]
+			# timestamp larger than upper bounds, or duplicated point
+			if point[0] > interval[1] or prev == point: continue
+			# timestamp smaller than lower bounds, or previous day's data
+			if point[0] <= interval[0] or (prev and point[0] > prev[0]): break
+			prev = point
+			deck.appendleft(point)
+		return deck
+
+	def unsaved_results(self, interval=None):
+		results = self.result_slice((self.saved_at, self.tomorrow))
+		if len(results): self.saved_at = results[-1][0]
+		return results
+
+
+class Charts(object):
+	def __init__(self, app, icon_size):
+		self.app = app
+		self.icon_size = icon_size
+
+	def __getattr__(self, key):
+		return getattr(self.app, key)
+
+	def compose_icon(self, results, width=None, interval=None, host=None):
+		if not results: return None
+		if host:
+			results = filter(lambda x: x[0] == host, results) if isinstance(host, str) else [results[host]]
+		if not width: width = self.icon_size
+		if not interval: interval = (-30, 0)
+		# print [results[2][1][x] for x in xrange(-10, 0)]
+		results = self.slice_results(results)
+		charts = len(results)
+		size = int(width / charts)
+		extra_rows = width - size * charts
+		data = [self.icon_section(x, size, not i and extra_rows) for i, x in enumerate(results)]
+		data = list(itertools.chain(*data))
+		data = self.icon_blips(data)
+		return bytearray(x for pixel in data for x in pixel)
+
+	def slice_results(self, results, width=None, interval=None):
+		# results: ((url, ((timestamp, ping_time), (time, ping))), (url, ...))
+		# deque can't be sliced, and itertools.islice doesn't support negative indexes
+		num = 16
+		single_time = lambda res, i: res[1][i][1]
+		slice_result = lambda result: [single_time(result, i) for i in xrange(-num, 0)]
+		if len(results) > 4: results = results[0:4]
+		return map(slice_result, results)
+
+	def icon_blips(self, data):
+		"""Sets some blips along the icon bottom to indicate movement."""
+		size = self.icon_size
+		offset = size**2
+		offset += (size - int(time.time() / self.app.wxapp.rate % size) - 1) % 4
+		indexes = [-0.25 * x for x in xrange(1, 5)]
+		indexes = (offset + int(x * size) for x in indexes)
+		for x in indexes: data[x] = [255 - b for b in data[x]]
+		return data
+
+	def icon_section(self, data, size=None, extra_rows=0):
+		if not size: size = self.icon_size
+		scale = float(self.app.wxapp.scale)
+
+		# note on helper methods:
+		# normalize: ping_time into a 0..1 number based on self.scale
+		# black/colored: (r, g, b) tuple, black or green-yellow-red (based on a normalized value)
+		# pixels: 0..x row black + 0..x row colored + 1 row black
+		# column: get pixels for a value and height
+		normalize = lambda value: 0 if value < 0 else (min(1, (value or 1000) / scale))
+		black = lambda h: ((0, 0, 0),) * h
+		colored = lambda n, h: ((int(255 * min(1, 2 * n)), int(255 * min(1, 2 * (1 - n))), 0),) * h
+		pixels = lambda n, h: black(size - 1 - h + int(extra_rows)) + colored(n, h) + black(1)
+		column = lambda normval: pixels(normval, max(1, int(round((size - 1) * normval))) if normval else 0)
+
+		data = map(column, map(normalize, data))
+		data = zip(*data) # flips the generated pixels (x,y -> y,x)
+		return list(itertools.chain(*data)) # flattened list of pixel tuples
 
 
 if __name__ == '__main__':
-
-	config = mapping({
-		'pinger': ['www.google.com', 0.8],
-		'store_pings': 640,
-		'slowest_ping': 300,
-		'interval': 1,
-		'icon_size': 16,
-		'menu': [
-			['Refresh rate:'],
-			['0.5 sec', 'set_interval', 0.5],
-			['1 sec', 'set_interval', 1],
-			['2 sec', 'set_interval', 2],
-			['5 sec', 'set_interval', 5],
-			['10 sec', 'set_interval', 10],
-			[''],
-			['Quit (Double-click)', 'OnClose'],
-		],
-	})
-
-	config.pinger = Pinger(*config.pinger)
-	app = App(config)
-	app.MainLoop()
-	exit()
-
-	# icon = Image.open('icons/boilerplate.png')
-	# icon.save(f, 'BMP')
-	# f = f.getvalue()[14:]
-	# l = len(f)
-	# header = (0, 0, 1, 0, 1, 0) + (16, 16, 0, 0, 1, 0, 32, 0) + (l % 16, (l % 256) / 16, (l / 256) % 16, (l / 256) / 16) + (22, 0)
-	# print header
-	# header = bytearray(header)
-	# with open('icons/asd.png', 'wb') as ff: ff.write(f)
-	# with open('icons/asd2.ico', 'wb') as ff: ff.write(header + f)
-	# exit()
-
-	# icon = Image.fromstring('RGB', (16, 16), '\xff\xff\xff\xff\x00\x00' * (8 * 16))
-	# icon.save(f, 'GIF')
-	# icon.save('sample.gif', 'GIF')
-	# with open('sample2.gif', 'wb') as ff: ff.write(f.getvalue())
-
-
-	# app = Flask(__name__)
-	# config = mapping({'ping': { 'url': 'www.google.com', 'timeout': 2, 'interval': 5 }})
-	# pinger = Pinger(config.ping.url, timeout=config.ping.timeout)
-
-	# app.add_url_rule('/ping', 'ping', pinger.ping)
-	# app.add_url_rule('/', 'index', index)
-	# app.run(debug=True)
+	plite = Plite(config.config)
+	plite.start()

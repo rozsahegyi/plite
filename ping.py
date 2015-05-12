@@ -114,12 +114,13 @@ class Ping(object):
     #--------------------------------------------------------------------------
 
     def log(self, message):
-        with open('plite.txt', 'a') as f:
-            f.write('%s  %s\n' % (time.strftime('%y%m%d %X'), message))
+        pass
+        # with open('d:/work/web/plite/logs/plite.txt', 'a') as f:
+        #     f.write('%s  %s\n' % (time.strftime('%y%m%d %X'), message))
 
     def print_start(self):
         # print("\nPYTHON-PING %s (%s): %d data bytes" % (self.destination, self.dest_ip, self.packet_size))
-        #print "%s  %s (%s): %d data bytes --" % (time.ctime(), self.destination, self.dest_ip, self.packet_size),
+        # print "%s  %s (%s): %d data bytes --" % (time.ctime(), self.destination, self.dest_ip, self.packet_size)
         pass
 
     def print_unknown_host(self, e):
@@ -139,7 +140,7 @@ class Ping(object):
         # print("ICMP header: %r" % icmp_header)
 
     def print_failed(self):
-        print("%s  Request timed out." % time.ctime())
+        # print("%s  Request timed out." % time.ctime())
         self.log("%s  Request timed out." % time.ctime())
 
     def print_exit(self):
@@ -226,8 +227,7 @@ class Ping(object):
             raise # raise the original error
 
         send_time = self.send_one_ping(current_socket)
-        if send_time == None:
-            return
+        if send_time == None: return
         self.send_count += 1
 
         receive_time, packet_size, ip, ip_header, icmp_header = self.receive_one_ping(current_socket)
@@ -246,6 +246,7 @@ class Ping(object):
             return delay
         else:
             self.print_failed()
+            return 0
 
     def send_one_ping(self, current_socket):
         """
@@ -281,9 +282,10 @@ class Ping(object):
         try:
             current_socket.sendto(packet, (self.destination, 1)) # Port number is irrelevant for ICMP
         except socket.error as e:
-            print("%s  General failure (%s)" % (time.ctime(), e.args[1]))
+            # print("%s  General failure (%s)" % (time.ctime(), e.args[1]))
             self.log("%s  General failure (%s)" % (time.ctime(), e.args[1]))
             current_socket.close()
+            raise e
             return
 
         return send_time

@@ -20,10 +20,9 @@ class Plite(object):
 
 	@property
 	def results(self):
-		# only used every x seconds once, no need to cache
-		self.last_results = [pinger.results[-1][1] for pinger in self.pingers]
-		logger.info(self.last_results)
-		return [(pinger.destination, pinger.results) for pinger in self.pingers if self.config.hosts[pinger.destination]]
+		# used once every x seconds, no point to cache
+		self.last_results = [p.results[-1][1] for p in self.pingers]
+		return [(p.destination, p.results) for p in self.pingers if self.config.hosts[p.destination]]
 
 	def ping_hosts(self):
 		"""Runs threads for pinging each host, blocks for timeout seconds."""

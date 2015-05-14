@@ -25,10 +25,11 @@ class App(wx.App):
 
 	@property
 	def host_order(self):
+		# no caching, used only at initial menu generation and click events
 		return sorted(self.app.config.hosts)
 
 	def OnInit(self):
-		self.frame = wx.Frame(None, wx.ID_ANY, 'Plite 1.0')#, style=wx.FRAME_NO_TASKBAR)
+		self.frame = wx.Frame(None, wx.ID_ANY, 'Plite 1.0')
 		self.tb = wx.TaskBarIcon()
 		self.tb.frame = self.frame
 
@@ -59,7 +60,6 @@ class App(wx.App):
 		# add the latest ping info to the tooltip
 		if self.tb:
 			self.tb.SetIcon(icon, ' | '.join('%d ms' % x for x in self.app.last_results))
-		# self.tb.SetIcon(wx.Icon('icons/favicon.ico', wx.BITMAP_TYPE_ICO))
 
 	def setup_menu(self):
 		# methods to generate various menu items
@@ -74,21 +74,23 @@ class App(wx.App):
 		}
 
 		def transform(item):
-			# store any untransformed list of values -- TODO: purify this!
-			if item and item[1:]: setattr(self, item[0], item[1:])
+			# apply the proper method for menu items, and store original options
+			if item and item[1:] and item[0].endswith('_options'):
+				self.options[item[0][0:-8]] = item[1:]
 			method = 'separator' if not item or not item[0] else 'normal' if item[0] not in methods else item[0]
 			return methods[method](item)
+
+		self.options = defaultdict(list)
+		self.option_ids = defaultdict(dict)
+		self.menu = wx.Menu()
 
 		# generate menu items, flatten the nested list
 		menu = [item for sub in map(transform, self.config.menu) for item in sub]
 
 		# here menu is a list of: ['name', item_kind, callback, callback_args]
-		# map each option with their respective index (so we can set "scale option #2")
-		self.menu = wx.Menu()
-		self.option_ids = defaultdict(dict)
 		for i, item in enumerate(menu):
 			menu[i] = item = [wx.NewId()] + item if item[0] else [wx.ID_SEPARATOR]
-			# store the ids of multi-option elements associated with functions,
+			# store the ids of multi-option elements associated with callbacks,
 			# so it's simpler to find the menu item for a given option
 			if len(item) > 4:
 				func, option = item[3:5]
@@ -100,8 +102,6 @@ class App(wx.App):
 		# check each host option
 		for i, x in enumerate(self.host_order): self.toggle_host(None, i)
 
-		# [menu.MenuItems[i].Enable(False) for i, x in enumerate(self.menu) if x[1:] and x[1] is False]
-
 		# add callbacks to menu items -- seems the callback function has to be bound?
 		# create a lambda (the inner one) which calls the intended callback, and bind it to self
 		bound_func = lambda func, args: partial(lambda s2, event: getattr(self, func)(event, *args), self)
@@ -109,25 +109,6 @@ class App(wx.App):
 		# params for Bind for menuitem callbacks (method is item[2], args are item[3:])
 		bind_params = [(wx.EVT_MENU, bound_func(item[3], item[4:]), item[0]) for item in menu if item[3:]]
 		list(itertools.starmap(self.tb.Bind, bind_params))
-
-	def OnClose(self, event):
-		logger.debug('program closed: %s', event)
-		self.running = False
-		self.tb.RemoveIcon()
-		self.tb.Destroy()
-		self.frame.Destroy()
-		self.Exit()
-
-	def FrameFocus(self, event):
-		logger.debug('FrameFocus: %s %s %s', event, event.EventObject, event.Id)
-
-	def TaskBarFocus(self, event):
-		logger.debug('TaskBarFocus: %s %s %s', event, event.EventObject, event.Id)
-		pass
-
-	def TaskBarMenu(self, event):
-		logger.debug('TaskBarMenu: %s %s %s', event, event.EventObject, event.Id)
-		self.tb.PopupMenu(self.menu)
 
 	def toggle_host(self, event, option=0, host=None):
 		if host:
@@ -142,11 +123,27 @@ class App(wx.App):
 
 	def set_option(self, event, option=0, key=None, value=None):
 		"""Handles setting multi-choice options (radio buttons)."""
-		key_options = key + '_options'
-		# options and their values are stored in self.x_options
-		self.config[key] = value or getattr(self, key_options)[option]
-		# if no event, get the menuitem id from self.option_ids
+		self.config[key] = value or self.options[key][option]
+		# if no event, get the stored menuitem id
 		id = event.Id if event else self.option_ids[key][option]
 		self.menu.FindItemById(id).Check()
 		logger.debug('set_option: id=%d, option=%d, %s=%d', id, option, key, self.config[key])
+
+	def OnClose(self, event):
+		logger.debug('OnClose: %s', event)
+		self.running = False
+		self.tb.RemoveIcon()
+		self.tb.Destroy()
+		self.frame.Destroy()
+		self.Exit()
+
+	def FrameFocus(self, event):
+		logger.debug('FrameFocus: %s %s %s', event, event.EventObject, event.Id)
+
+	def TaskBarFocus(self, event):
+		logger.debug('TaskBarFocus: %s %s %s', event, event.EventObject, event.Id)
+
+	def TaskBarMenu(self, event):
+		logger.debug('TaskBarMenu: %s %s %s', event, event.EventObject, event.Id)
+		self.tb.PopupMenu(self.menu)
 

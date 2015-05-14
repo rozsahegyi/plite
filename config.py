@@ -1,6 +1,6 @@
 
 config = {
-	'logfile': '',#'plite.log',
+	'logfile': 'plite.log',
 	'logs': 'logs/',
 	'save_interval': 10, # save results every x seconds
 	'hosts': ['yahoo.com', 'google.com', 'imgur.com'],

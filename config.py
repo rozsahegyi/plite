@@ -1,9 +1,9 @@
-import json
 
 config = {
+	'logfile': '',#'plite.log',
+	'logs': 'logs/',
 	'save_interval': 10, # save results every x seconds
-	'save_dir': 'logs/plite/',
-	'hosts': ['192.168.3.1', 'google.com', 'imgur.com'],
+	'hosts': ['yahoo.com', 'google.com', 'imgur.com'],
 	'icon_size': 16,
 	'pinger': {
 		'timeout': 0.7, # should be somewhat less than the smallest ping rate
@@ -32,17 +32,15 @@ config = {
 
 
 class mapping(dict):
-	"""Dict with attribute access, credits: http://stackoverflow.com/a/14620633/1393194"""
-	def __init__(self, content, *args, **kw):
-		if isinstance(content, (str, unicode)):
-			content = self.unpack(content)
-		elif not hasattr(content, 'iteritems'):
-			raise Exception('mapping with %s argument' % type(content))
+	"""Dict with attribute access. Accepts dict-like objects or tuple list."""
+	def __init__(self, content=None, *args, **kw):
+		content = content.iteritems() if hasattr(content, 'iteritems') else content or []
+		if content:
+			content = ((k, mapping(v) if isinstance(v, dict) else v) for k, v in content if k and k[0] != '_')
 		super(mapping, self).__init__(content, *args, **kw)
 		self.__dict__ = self
-		[self.__setitem__(k, mapping(v)) for k, v in self.iteritems() if isinstance(v, dict)]
+	def __getattr__(self, key):
+		return None
 
-	def pack(self): return json.dumps(self, ensure_ascii=False)
-	def unpack(self, content): return json.loads(content)
 
 config = mapping(config)

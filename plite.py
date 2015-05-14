@@ -1,36 +1,40 @@
-import os, threading, socket, time, itertools
+import os, threading, socket, time, itertools, logging
 from collections import deque
 import ping, config, wxtray
 
-def message(msg, *args):
-	print '%s.%03d  %s' % (time.strftime('%H:%M:%S'), time.time() % 1 * 1000, msg), args or ''
-	pass
+logging.basicConfig(format='%(asctime)-15s %(name)-10s  %(message)s', filename=config.config.logfile or None)
+logger = logging.getLogger('plite')
+logger.setLevel(logging.INFO)
+
 
 class Plite(object):
 	def __init__(self, config):
 		self.running = False
 		self.config = config
-		self.wxapp = wxtray.App(self, hosts=config.hosts, icon_size=config.icon_size, **config.wxapp)
-		self.charts = Charts(self, icon_size=config.icon_size)
-		message('Setting up hosts...')
-		self.hosts = [Pinger(url, **config.pinger) for url in config.hosts]
+		self.config.hosts = dict.fromkeys(self.config.hosts, None)
+		self.wxapp = wxtray.App(self)
+		self.charts = Charts(self)
+		logger.info('Setting up hosts...')
+		self.pingers = [Pinger(url, **config.pinger) for url in sorted(self.config.hosts)]
 		self.saved = 0
 
 	@property
 	def results(self):
 		# only used every x seconds once, no need to cache
-		return [(pinger.destination, pinger.results) for pinger in self.hosts]
+		self.last_results = [pinger.results[-1][1] for pinger in self.pingers]
+		logger.info(self.last_results)
+		return [(pinger.destination, pinger.results) for pinger in self.pingers if self.config.hosts[pinger.destination]]
 
 	def ping_hosts(self):
 		"""Runs threads for pinging each host, blocks for timeout seconds."""
-		for x in self.hosts: threading.Thread(target=x.ping).start()
+		for x in self.pingers: threading.Thread(target=x.ping).start()
 		time.sleep(self.config.pinger.timeout + 0.3)
-		for x in self.hosts:
+		for x in self.pingers:
 			if len(x.results[-1]) > 2: msg = ', '.join(map(str, x.results[-1][2:]))
-			elif not x.results[-1][1]: msg = 'response timed out'
+			elif not x.results[-1][1]: continue # 'response timed out'
 			elif x.results[-1][1] < 0: msg = 'sending timed out'
 			else: continue
-			message('%-20s  %s' % (x.destination, msg), x.results[-1])
+			logger.info('%-20s  %s', x.destination, msg)
 
 	def update_wxapp(self):
 		self.wxapp.update_event(self.charts.compose_icon(self.results))
@@ -45,46 +49,42 @@ class Plite(object):
 		time_to_ping = lambda now: now >= last
 		time_to_save = lambda now: now >= self.saved
 		self.running = True
-		message('Plite running...')
+		logger.info('Plite running...')
 
 		while self.running and self.wxapp.running:
 			now = time.time()
 			if time_to_ping(now):
-				last += self.wxapp.rate
-				# message('Pinging...')
+				last += self.config.wxapp.rate
 				self.ping_hosts()
-				# message('Updating...')
 				self.update_wxapp()
 			if time_to_save(now):
 				self.saved = now + self.config.save_interval
 				threading.Thread(target=self.save).start()
 			time.sleep(0.05)
-		message('Plite stopped.')
+		logger.info('Plite stopped.')
 
 	def save(self):
-		for x in self.hosts: self.save_results(x)
+		for x in self.pingers: self.save_results(x)
 
 	def save_results(self, pinger):
 		data = pinger.unsaved_results()
 		if not data: return
-		print 'saving:', pinger.destination, data
+		logger.info('saving: %s %s', pinger.destination, data)
 		data = '\n'.join(':'.join(map(str, x)) for x in data) + '\n'
 		stamp = time.strftime('%Y%m%d', time.localtime(pinger.today))
-		save_dir = self.config.save_dir
+		save_dir = self.config.logs
 		if not os.path.exists(save_dir): os.makedirs(save_dir)
 		filename = '%s_%s.txt' % (pinger.destination, stamp)
 		filename = os.path.join(save_dir, filename)
-		# with open(filename, 'a') as f: f.write(data)
+		with open(filename, 'a') as f: f.write(data)
 
 
-# class Pinger(ping.Ping):
 class Pinger(object):
 	blank = (0, -1)
 	results = []
 
 	def __init__(self, url='', timeout=0.8, stored=100, **kw):
 		if not url: raise Exception('Pinger instances always need an url.')
-		# super(Pinger, self).__init__(url, timeout * 1000)
 		self.destination = url
 		self.timeout = timeout * 1000
 		self.results = deque((self.blank,) * stored, maxlen=stored)
@@ -163,21 +163,27 @@ class Pinger(object):
 
 
 class Charts(object):
-	def __init__(self, app, icon_size):
+	def __init__(self, app):
 		self.app = app
-		self.icon_size = icon_size
+		self.default_interval = (-30, 0)
 
 	def __getattr__(self, key):
-		return getattr(self.app, key)
+		"""Get some attributes from the main config or the wxapp subdict."""
+		# used for: icon_size, scale, rate
+		return getattr(self.app.config, key, None) or getattr(self.app.config.wxapp, key, None)
 
 	def compose_icon(self, results, width=None, interval=None, host=None):
+		"""Generates a bytearray needed for an icon.
+
+		Currently just takes the last x results, ignoring the slice setting.
+		"""
 		if not results: return None
+		if not width: width = self.icon_size
+		if not interval: interval = self.default_interval
 		if host:
 			results = filter(lambda x: x[0] == host, results) if isinstance(host, str) else [results[host]]
-		if not width: width = self.icon_size
-		if not interval: interval = (-30, 0)
-		# print [results[2][1][x] for x in xrange(-10, 0)]
-		results = self.slice_results(results)
+
+		results = self.slice_times(results, width)
 		charts = len(results)
 		size = int(width / charts)
 		extra_rows = width - size * charts
@@ -186,32 +192,38 @@ class Charts(object):
 		data = self.icon_blips(data)
 		return bytearray(x for pixel in data for x in pixel)
 
-	def slice_results(self, results, width=None, interval=None):
-		# results: ((url, ((timestamp, ping_time), (time, ping))), (url, ...))
-		# deque can't be sliced, and itertools.islice doesn't support negative indexes
-		num = 16
-		single_time = lambda res, i: res[1][i][1]
-		slice_result = lambda result: [single_time(result, i) for i in xrange(-num, 0)]
+	def slice_times(self, results, num=None, interval=None):
+		"""Takes the times of the last num elements in each result.
+
+		TODO: consider the timestamps of results and the current timeframe (slice setting)
+
+		results: ((url, ((time1, ping), (time2, ping2), ...)), (url, ...))
+		returns: [[time1, time2, ...], [time3, time4, ...]]
+		"""
 		if len(results) > 4: results = results[0:4]
+		slice_result = lambda result: [result[1][i][1] for i in xrange(-num, 0)]
 		return map(slice_result, results)
 
-	def icon_blips(self, data):
+	def icon_blips(self, data, interval=4):
 		"""Sets some blips along the icon bottom to indicate movement."""
 		size = self.icon_size
-		offset = size**2
-		offset += (size - int(time.time() / self.app.wxapp.rate % size) - 1) % 4
-		indexes = [-0.25 * x for x in xrange(1, 5)]
-		indexes = (offset + int(x * size) for x in indexes)
+		last_index = size**2
+		blips = size / interval
+		# offset decreases as time passes, use an interval-sized part
+		offset = (size - int(time.time() / self.rate % size) - 1) % interval
+		# add this to the last index, and reduce it for each blip
+		indexes = [last_index + offset - int(interval * x) for x in xrange(1, 1 + blips)]
+		# invert colors of pixels at these indexes
 		for x in indexes: data[x] = [255 - b for b in data[x]]
 		return data
 
 	def icon_section(self, data, size=None, extra_rows=0):
 		if not size: size = self.icon_size
-		scale = float(self.app.wxapp.scale)
+		scale = float(self.scale)
 
 		# note on helper methods:
 		# normalize: ping_time into a 0..1 number based on self.scale
-		# black/colored: (r, g, b) tuple, black or green-yellow-red (based on a normalized value)
+		# black/colored: tuple of (r, g, b) tuples, black or green-yellow-red (normalized range)
 		# pixels: 0..x row black + 0..x row colored + 1 row black
 		# column: get pixels for a value and height
 		normalize = lambda value: 0 if value < 0 else (min(1, (value or 1000) / scale))

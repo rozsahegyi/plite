@@ -21,7 +21,7 @@ class Plite(object):
 	@property
 	def results(self):
 		# used once every x seconds, no point to cache
-		self.last_results = [p.results[-1][1] for p in self.pingers]
+		self.last_results = [p.results[-1][1] for p in self.pingers if self.config.hosts[p.destination]]
 		return [(p.destination, p.results) for p in self.pingers if self.config.hosts[p.destination]]
 
 	def ping_hosts(self):
